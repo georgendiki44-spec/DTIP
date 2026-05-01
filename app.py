@@ -989,50 +989,84 @@ HTML = """<!DOCTYPE html>
   --accent: #00d4aa;
   --danger: #ef4444;
   --success: #10b981;
+  --warning: #f59e0b;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; line-height: 1.6; }
-nav { position: sticky; top: 0; z-index: 100; background: rgba(5,8,16,0.85); backdrop-filter: blur(20px);
+nav { position: sticky; top: 0; z-index: 100; background: rgba(5,8,16,0.95); backdrop-filter: blur(20px);
   border-bottom: 1px solid var(--border); padding: 0 24px; height: 64px; display: flex; align-items: center; justify-content: space-between; }
-.nav-brand { font-family: 'Syne'; font-size: 22px; font-weight: 800;
-  background: linear-gradient(135deg, var(--accent), #60a5fa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; cursor: pointer; }
+.nav-brand { font-family: 'Syne'; font-size: 24px; font-weight: 800;
+  background: linear-gradient(135deg, var(--accent), #60a5fa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; cursor: pointer; letter-spacing: -1px; }
+.nav-center { display: flex; gap: 20px; }
+.nav-link { color: var(--text2); cursor: pointer; padding: 8px 16px; border-radius: 8px; transition: all 0.2s; font-weight: 500; }
+.nav-link:hover { background: var(--border); color: var(--text); }
+.nav-link.active { color: var(--accent); background: rgba(0,212,170,0.1); }
 
 .container { max-width: 1280px; margin: 0 auto; padding: 0 24px; }
 .page { display: none; min-height: 100vh; padding: 40px 24px; }
 .page.active { display: block; }
 
-.hero { text-align: center; padding: 100px 0; }
-.hero h1 { font-family: 'Syne'; font-size: 48px; font-weight: 800; margin-bottom: 20px; }
-.btn { display: inline-flex; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer; border: none; transition: all 0.2s; font-family: inherit; }
+.hero { text-align: center; padding: 80px 0 60px; background: radial-gradient(ellipse at center, rgba(0,212,170,0.08) 0%, transparent 70%); }
+.hero h1 { font-family: 'Syne'; font-size: clamp(32px, 6vw, 56px); font-weight: 800; margin-bottom: 20px; line-height: 1.1; }
+.hero p { font-size: 18px; color: var(--text2); margin-bottom: 30px; max-width: 500px; margin-left: auto; margin-right: auto; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 24px; border-radius: 10px; font-weight: 600; cursor: pointer; border: none; transition: all 0.2s; font-family: inherit; font-size: 15px; }
 .btn-primary { background: var(--accent); color: #000; }
-.btn-primary:hover { background: #00b891; }
-.btn-secondary { background: var(--border); color: var(--text); }
-.card { background: rgba(15,20,35,0.8); border: 1px solid var(--border); border-radius: 16px; padding: 24px; margin-bottom: 20px; }
-.form-input { width: 100%; padding: 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); margin-bottom: 16px; font-family: inherit; }
-.form-input:focus { outline: none; border-color: var(--accent); }
+.btn-primary:hover { background: #00b891; transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,212,170,0.3); }
+.btn-secondary { background: var(--border); color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { background: var(--border); border-color: var(--accent); }
+.btn-sm { padding: 8px 16px; font-size: 14px; }
+.card { background: rgba(15,20,35,0.6); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 16px; transition: all 0.3s; }
+.card:hover { border-color: var(--accent); transform: translateY(-4px); box-shadow: 0 12px 32px rgba(0,212,170,0.1); }
+.form-input { width: 100%; padding: 12px 14px; background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; color: var(--text); margin-bottom: 16px; font-family: inherit; transition: all 0.2s; }
+.form-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0,212,170,0.1); }
+.form-input::placeholder { color: var(--text2); }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-@media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
-.modal { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.7); align-items: center; justify-content: center; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+@media (max-width: 768px) { .grid-2, .grid-3 { grid-template-columns: 1fr; } .nav-center { display: none; } }
+.modal { display: none; position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.8); backdrop-filter: blur(8px); align-items: center; justify-content: center; padding: 20px; }
 .modal.open { display: flex; }
-.modal-content { background: var(--bg2); border: 1px solid var(--border); border-radius: 16px; padding: 32px; width: 90%; max-width: 560px; }
-.toast { position: fixed; bottom: 20px; right: 20px; padding: 14px 20px; border-radius: 8px; background: rgba(16,185,129,0.15); color: #6ee7b7; z-index: 300; animation: slideIn 0.3s ease; }
+.modal-content { background: var(--bg2); border: 1px solid var(--border); border-radius: 18px; padding: 32px; width: 100%; max-width: 500px; max-height: 90vh; overflow-y: auto; animation: modalIn 0.3s ease; }
+@keyframes modalIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+.modal h2 { margin-bottom: 20px; font-family: 'Syne'; font-size: 24px; }
+.toast { position: fixed; bottom: 20px; right: 20px; padding: 14px 18px; border-radius: 10px; background: rgba(16,185,129,0.15); color: #6ee7b7; z-index: 300; animation: slideIn 0.3s ease; border-left: 4px solid var(--success); }
 @keyframes slideIn { from { transform: translateX(400px); opacity: 0; } to { transform: none; opacity: 1; } }
-.tag { display: inline-block; padding: 4px 10px; border-radius: 100px; font-size: 12px; background: var(--border); color: var(--text2); }
-.admin-sidebar { position: fixed; left: 0; top: 64px; width: 260px; height: calc(100vh - 64px); background: var(--bg2); border-right: 1px solid var(--border); padding: 20px 0; overflow-y: auto; }
-.admin-item { padding: 12px 20px; cursor: pointer; color: var(--text2); transition: all 0.2s; border-left: 3px solid transparent; }
-.admin-item:hover { background: var(--border); color: var(--text); }
-.admin-item.active { background: rgba(0,212,170,0.1); color: var(--accent); border-left-color: var(--accent); }
-.admin-content { margin-left: 260px; }
+.tag { display: inline-block; padding: 5px 12px; border-radius: 100px; font-size: 12px; background: var(--border); color: var(--text2); font-weight: 500; }
+.tag-accent { background: rgba(0,212,170,0.1); color: var(--accent); }
+.stat-box { background: rgba(0,212,170,0.05); border: 1px solid rgba(0,212,170,0.1); border-radius: 12px; padding: 16px; text-align: center; }
+.stat-value { font-family: 'Syne'; font-size: 28px; font-weight: 900; color: var(--accent); }
+.stat-label { font-size: 12px; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 6px; }
+.sidebar { position: fixed; left: 0; top: 64px; width: 260px; height: calc(100vh - 64px); background: var(--bg2); border-right: 1px solid var(--border); padding: 20px 0; overflow-y: auto; transition: transform 0.3s; }
+.sidebar-item { padding: 12px 20px; cursor: pointer; color: var(--text2); transition: all 0.2s; border-left: 3px solid transparent; display: flex; align-items: center; gap: 10px; }
+.sidebar-item:hover { background: var(--border); color: var(--text); }
+.sidebar-item.active { background: rgba(0,212,170,0.1); color: var(--accent); border-left-color: var(--accent); }
+.content { margin-left: 260px; transition: margin 0.3s; }
+@media (max-width: 768px) { .sidebar { transform: translateX(-100%); } .sidebar.open { transform: translateX(0); } .content { margin-left: 0; } }
+.table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+.table th { text-align: left; padding: 12px; border-bottom: 1px solid var(--border); font-weight: 600; color: var(--text2); font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; }
+.table td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+.empty { text-align: center; padding: 40px 20px; color: var(--text2); }
+.empty-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.5; }
+.badge { display: inline-block; padding: 4px 10px; border-radius: 100px; font-size: 12px; font-weight: 600; }
+.badge-success { background: rgba(16,185,129,0.1); color: var(--success); }
+.badge-pending { background: rgba(245,158,11,0.1); color: var(--warning); }
+.badge-error { background: rgba(239,68,68,0.1); color: var(--danger); }
 </style>
 </head>
 <body>
 <nav>
   <div class="nav-brand" onclick="navigate('home')">DTIP</div>
+  <div class="nav-center">
+    <div class="nav-link" onclick="navigate('home')">Home</div>
+    <div class="nav-link" onclick="navigate('tasks')">Browse</div>
+    <div class="nav-link" id="dash-link" style="display:none" onclick="navigate('dashboard')">Dashboard</div>
+    <div class="nav-link" id="wallet-link" style="display:none" onclick="navigate('wallet')">Wallet</div>
+    <div class="nav-link" id="admin-link" style="display:none" onclick="navigate('admin')">⚡Admin</div>
+  </div>
   <div style="display:flex;gap:8px">
     <button class="btn btn-secondary btn-sm" id="nav-login" onclick="openModal('login')">Login</button>
-    <button class="btn btn-primary btn-sm" id="nav-register" onclick="openModal('register')">Join</button>
+    <button class="btn btn-primary btn-sm" id="nav-register" onclick="openModal('register')">Join Free</button>
     <div id="nav-user" style="display:none;gap:8px;display:flex">
-      <button class="btn btn-secondary btn-sm" onclick="navigate('dashboard')">Dashboard</button>
+      <span style="padding:8px 16px;color:var(--text2);font-size:14px" id="user-name"></span>
       <button class="btn btn-danger btn-sm" onclick="logout()">Logout</button>
     </div>
   </div>
@@ -1069,10 +1103,20 @@ nav { position: sticky; top: 0; z-index: 100; background: rgba(5,8,16,0.85); bac
 <!-- DASHBOARD PAGE -->
 <div id="page-dashboard" class="page">
   <div class="container">
-    <h2 style="font-family:'Syne';font-size:28px">Dashboard</h2>
-    <div class="grid-2" style="margin: 30px 0">
-      <div class="card"><div style="color:var(--text2);font-size:12px">Balance</div><div style="font-family:'Syne';font-size:32px;font-weight:900;color:var(--accent)" id="dash-balance">0</div></div>
-      <div class="card"><div style="color:var(--text2);font-size:12px">Earned</div><div style="font-family:'Syne';font-size:32px;font-weight:900" id="dash-earned">0</div></div>
+    <h1 style="font-family:'Syne';font-size:32px;margin-bottom:30px">Welcome Back 👋</h1>
+    <div class="grid-3" style="margin-bottom:30px">
+      <div class="stat-box">
+        <div class="stat-value" id="dash-balance">0</div>
+        <div class="stat-label">Available Balance</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value" id="dash-earned">0</div>
+        <div class="stat-label">Total Earned</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value" id="dash-tasks">0</div>
+        <div class="stat-label">Active Tasks</div>
+      </div>
     </div>
     <button class="btn btn-primary" id="post-btn" style="display:none;margin-bottom:20px" onclick="openModal('post-task')">+ Post Task</button>
     <div id="dash-content"></div>
@@ -1209,7 +1253,13 @@ function updateNav() {
   document.getElementById('nav-login').style.display = logged ? 'none' : 'block';
   document.getElementById('nav-register').style.display = logged ? 'none' : 'block';
   document.getElementById('nav-user').style.display = logged ? 'flex' : 'none';
+  document.getElementById('user-name').textContent = logged ? `${user.name} (${user.role})` : '';
+  document.getElementById('dash-link').style.display = logged ? 'block' : 'none';
+  document.getElementById('wallet-link').style.display = logged ? 'block' : 'none';
+  document.getElementById('admin-link').style.display = (logged && user.role === 'admin') ? 'block' : 'none';
   document.getElementById('post-btn').style.display = (logged && ['client', 'admin'].includes(user.role)) ? 'block' : 'none';
+  document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+  document.querySelector(`.nav-link[onclick*="${currentPage}"]`)?.classList.add('active');
 }
 
 async function doLogin() {
@@ -1246,9 +1296,16 @@ async function loadHome() {
     const tasks = await api('GET', '/api/tasks?limit=6');
     document.getElementById('featured-tasks').innerHTML = tasks.map(t => `
       <div class="card" style="cursor:pointer" onclick="navigate('tasks')">
-        <div class="tag">${t.category}</div>
-        <h3 style="font-weight:700;margin:10px 0">${t.title}</h3>
-        <div style="font-family:'Syne';font-size:24px;font-weight:900;color:var(--accent)">KES ${t.budget}</div>
+        <div style="display:flex;justify-content:space-between;align-items:start;margin-bottom:10px">
+          <div class="tag tag-accent">${t.category}</div>
+          <span class="badge badge-success">Open</span>
+        </div>
+        <h3 style="font-weight:700;margin-bottom:8px;font-size:16px">${t.title}</h3>
+        <p style="color:var(--text2);font-size:13px;margin-bottom:12px">${t.description?.slice(0,60)}...</p>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="font-family:'Syne';font-size:20px;font-weight:900;color:var(--accent)">KES ${t.budget}</div>
+          <span style="font-size:12px;color:var(--text2)">${t.applications_count || 0} applied</span>
+        </div>
       </div>
     `).join('');
   } catch (e) {}
