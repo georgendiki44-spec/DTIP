@@ -24,40 +24,41 @@ import requests as http_req
 # ─────────────────────────────────────────
 app = Flask(__name__)
 # ── Stable secret key: persisted to disk if not in env so tokens survive restarts ──
-_secret_key = os.environ.get('SECRET_KEY', '')
-_secret_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.secret_key')
+# ── Stable secret: read from env, then from .secret_key file, else generate+persist ──
+_secret_key = os.environ.get('SECRET_KEY', '').strip()
 if not _secret_key:
-    if os.path.exists(_secret_file):
-        try:
+    _secret_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.secret_key')
+    try:
+        if os.path.exists(_secret_file):
             _secret_key = open(_secret_file).read().strip()
-        except Exception:
-            _secret_key = ''
+    except Exception:
+        pass
     if not _secret_key:
         _secret_key = secrets.token_hex(32)
         try:
-            with open(_secret_file, 'w') as _sf:
-                _sf.write(_secret_key)
+            open(_secret_file, 'w').write(_secret_key)
         except Exception:
-            pass  # can't write — that's ok, will regenerate next restart
-    import logging as _log
-    _log.getLogger('dtip').warning(
-        'SECRET_KEY not set in env — using persisted key from .secret_key file. '
-        'Set SECRET_KEY env var in production!'
-    )
+            pass  # ephemeral filesystem — tokens will break on restart; set SECRET_KEY env var
+
+# JWT_SECRET: explicit env var wins, else use the stable SECRET_KEY
+_jwt_secret = os.environ.get('JWT_SECRET', '').strip() or _secret_key
+
+_db_url = os.environ.get('DATABASE_URL', 'sqlite:///dtip.db').replace('postgres://', 'postgresql://')
+_is_postgres = _db_url.startswith('postgresql')
+_engine_opts = {'pool_pre_ping': True, 'pool_recycle': 300}
+if _is_postgres:
+    _engine_opts.update({
+        'pool_size': int(os.environ.get('DB_POOL_SIZE', 5)),
+        'max_overflow': int(os.environ.get('DB_MAX_OVERFLOW', 10)),
+        'connect_args': {'connect_timeout': 10},
+    })
 
 app.config.update(
     SECRET_KEY=_secret_key,
-    SQLALCHEMY_DATABASE_URI=os.environ.get('DATABASE_URL','sqlite:///dtip.db').replace('postgres://','postgresql://'),
+    SQLALCHEMY_DATABASE_URI=_db_url,
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
-    # FIX: robust DB pool so connections are recycled and pre-pinged
-    SQLALCHEMY_ENGINE_OPTIONS={
-        'pool_pre_ping': True,
-        'pool_recycle': 300,
-        'pool_size': int(os.environ.get('DB_POOL_SIZE', 5)),
-        'max_overflow': int(os.environ.get('DB_MAX_OVERFLOW', 10)),
-        'connect_args': {'connect_timeout': 10} if 'postgresql' in os.environ.get('DATABASE_URL','') else {},
-    },
-    JWT_SECRET=os.environ.get('JWT_SECRET', _secret_key),
+    SQLALCHEMY_ENGINE_OPTIONS=_engine_opts,
+    JWT_SECRET=_jwt_secret,
     JWT_EXPIRY_HOURS=int(os.environ.get('JWT_EXPIRY_HOURS',24)),
     GOOGLE_CLIENT_ID=os.environ.get('GOOGLE_CLIENT_ID',''),
     GOOGLE_CLIENT_SECRET=os.environ.get('GOOGLE_CLIENT_SECRET',''),
@@ -1265,6 +1266,12 @@ def all_shares(admin):
 @app.route('/api/wallet')
 @require_auth
 def get_wallet(user):
+    if not user.wallet:
+        # Wallet missing — create it on the fly
+        w = Wallet(user_id=user.id, balance=0.0)
+        db.session.add(w)
+        db.session.commit()
+        db.session.refresh(user)
     ledger_rows = WalletLedger.query.filter_by(wallet_id=user.wallet.id)\
                               .order_by(WalletLedger.created_at.desc()).limit(30).all()
     return jsonify(wallet=user.wallet.to_dict(), ledger=[l.to_dict() for l in ledger_rows])
@@ -1556,6 +1563,28 @@ def admin_completions(mod):
 @app.route('/api/health')
 def health():
     return jsonify(status='ok', version='3.0.0', ts=datetime.utcnow().isoformat())
+
+@app.route('/api/debug/auth')
+def debug_auth():
+    """Diagnose auth issues — remove in production"""
+    auth = request.headers.get('Authorization', '')
+    token = auth[7:].strip() if auth.lower().startswith('bearer ') else auth.strip()
+    token = token or request.args.get('token', '')
+    result = {'has_token': bool(token), 'jwt_secret_len': len(app.config.get('JWT_SECRET',''))}
+    if token:
+        try:
+            data = jwt.decode(token, app.config['JWT_SECRET'], algorithms=['HS256'])
+            result['valid'] = True
+            result['user_id'] = data.get('sub')
+            result['role'] = data.get('role')
+            result['expires'] = data.get('exp')
+        except jwt.ExpiredSignatureError:
+            result['valid'] = False
+            result['error'] = 'Token expired'
+        except jwt.InvalidTokenError as e:
+            result['valid'] = False
+            result['error'] = str(e)
+    return jsonify(result)
 
 @app.route('/api/stats')
 @cache.cached(timeout=120)
@@ -2298,12 +2327,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 // ── API ──
 async function api(url, method = 'GET', body = null) {
-  // Always read token fresh from S (which is loaded from localStorage at boot)
-  const tok = S.token || localStorage.getItem('tok');
-  if (tok && !S.token) S.token = tok;  // re-hydrate if somehow lost
+  // Always read token from S; re-hydrate from localStorage if somehow lost
+  if (!S.token) S.token = localStorage.getItem('tok') || null;
 
   const opts = { method, headers: { 'Content-Type': 'application/json' } };
-  if (tok) opts.headers['Authorization'] = 'Bearer ' + tok;
+  if (S.token) opts.headers['Authorization'] = 'Bearer ' + S.token;
   if (body) opts.body = JSON.stringify(body);
 
   let r;
@@ -2313,53 +2341,47 @@ async function api(url, method = 'GET', body = null) {
     throw new Error('Network error — check your connection');
   }
 
-  // Handle non-JSON responses (e.g. server 500 HTML pages) gracefully
+  // Handle non-JSON error responses (e.g. 500 HTML pages) gracefully
   let d;
   try {
     d = await r.json();
   } catch {
     if (r.status === 401) {
-      // Token rejected — clear it so next page load shows login
-      localStorage.removeItem('tok');
-      S.token = null;
-      throw new Error('Session expired. Please sign in again.');
+      _handle401();
+      throw new Error('Session expired — please sign in again.');
     }
-    throw new Error(`Server error (${r.status})`);
+    throw new Error('Server error (' + r.status + ')');
   }
 
-  if (!r.ok) {
-    if (r.status === 401) {
-      localStorage.removeItem('tok');
-      S.token = null;
-    }
-    throw new Error(d.error || d.message || `Request failed (${r.status})`);
+  if (r.status === 401) {
+    _handle401();
+    throw new Error(d.error || 'Session expired — please sign in again.');
   }
+  if (!r.ok) throw new Error(d.error || d.message || 'Request failed (' + r.status + ')');
   return d;
 }
 
+// Called whenever any API call gets a 401 — clears session and shows login
+function _handle401() {
+  const wasLoggedIn = !!S.token;
+  S.token = null; S.user = null;
+  localStorage.removeItem('tok');
+  if (S.socket) { try { S.socket.disconnect(); } catch(e){} S.socket = null; }
+  showAuth();
+  if (wasLoggedIn) toast('Your session expired. Please sign in again.', 'warn');
+}
+
 async function apiForm(url, formData) {
-  const tok = S.token || localStorage.getItem('tok');
-  if (tok && !S.token) S.token = tok;
-
+  if (!S.token) S.token = localStorage.getItem('tok') || null;
   const opts = { method: 'POST', headers: {} };
-  if (tok) opts.headers['Authorization'] = 'Bearer ' + tok;
+  if (S.token) opts.headers['Authorization'] = 'Bearer ' + S.token;
   opts.body = formData;
-
   let r;
-  try {
-    r = await fetch(url, opts);
-  } catch (networkErr) {
-    throw new Error('Network error — check your connection');
-  }
-
+  try { r = await fetch(url, opts); } catch(e) { throw new Error('Network error'); }
   let d;
-  try {
-    d = await r.json();
-  } catch {
-    throw new Error(`Server error (${r.status})`);
-  }
-
-  if (!r.ok) throw new Error(d.error || d.message || `Request failed (${r.status})`);
+  try { d = await r.json(); } catch { throw new Error('Server error (' + r.status + ')'); }
+  if (r.status === 401) { _handle401(); throw new Error(d.error || 'Session expired'); }
+  if (!r.ok) throw new Error(d.error || d.message || 'Request failed (' + r.status + ')');
   return d;
 }
 
@@ -2402,7 +2424,10 @@ function showAuth() {
 function showApp() {
   document.getElementById('authScreen').style.display = 'none';
   document.getElementById('appScreen').style.display = 'grid';
-  initApp();
+  initApp().catch(e => {
+    console.error('initApp failed:', e);
+    // If init fails due to auth, _handle401 inside api() will redirect to login
+  });
 }
 function authTab(t) {
   document.getElementById('loginForm').style.display = t === 'login' ? 'block' : 'none';
@@ -2609,8 +2634,11 @@ function closeModal(id) { document.getElementById(id).classList.remove('show'); 
 async function home() {
   const el = document.getElementById('pageContent');
   try {
+    // Run all three in parallel; if stats/settings fail, degrade gracefully
     const [me, pub, sets] = await Promise.all([
-      api('/api/auth/me'), api('/api/stats'), loadSettings()
+      api('/api/auth/me'),
+      api('/api/stats').catch(() => ({users:0, tasks:0, completions:0, paid_out:0})),
+      loadSettings().catch(() => ({})),
     ]);
     S.user = me.user;
     const u = S.user, w = me.wallet;
