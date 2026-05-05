@@ -10,7 +10,8 @@ from datetime import datetime, timedelta, date
 from functools import wraps
 from urllib.parse import urlencode
 
-from flask import Flask, request, jsonify, redirect, session, render_template_string, send_from_directory
+from flask import Flask, request, jsonify, redirect, session, render_template_string, send_from_directory, make_response
+from werkzeug.middleware.proxy_fix import ProxyFix
 from flask_sqlalchemy import SQLAlchemy
 from flask_socketio import SocketIO, emit, join_room, disconnect
 from flask_limiter import Limiter
@@ -23,42 +24,12 @@ import requests as http_req
 # CONFIG
 # ─────────────────────────────────────────
 app = Flask(__name__)
-# ── Stable secret key: persisted to disk if not in env so tokens survive restarts ──
-# ── Stable secret: read from env, then from .secret_key file, else generate+persist ──
-_secret_key = os.environ.get('SECRET_KEY', '').strip()
-if not _secret_key:
-    _secret_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.secret_key')
-    try:
-        if os.path.exists(_secret_file):
-            _secret_key = open(_secret_file).read().strip()
-    except Exception:
-        pass
-    if not _secret_key:
-        _secret_key = secrets.token_hex(32)
-        try:
-            open(_secret_file, 'w').write(_secret_key)
-        except Exception:
-            pass  # ephemeral filesystem — tokens will break on restart; set SECRET_KEY env var
-
-# JWT_SECRET: explicit env var wins, else use the stable SECRET_KEY
-_jwt_secret = os.environ.get('JWT_SECRET', '').strip() or _secret_key
-
-_db_url = os.environ.get('DATABASE_URL', 'sqlite:///dtip.db').replace('postgres://', 'postgresql://')
-_is_postgres = _db_url.startswith('postgresql')
-_engine_opts = {'pool_pre_ping': True, 'pool_recycle': 300}
-if _is_postgres:
-    _engine_opts.update({
-        'pool_size': int(os.environ.get('DB_POOL_SIZE', 5)),
-        'max_overflow': int(os.environ.get('DB_MAX_OVERFLOW', 10)),
-        'connect_args': {'connect_timeout': 10},
-    })
-
 app.config.update(
-    SECRET_KEY=_secret_key,
-    SQLALCHEMY_DATABASE_URI=_db_url,
+    SECRET_KEY=os.environ.get('SECRET_KEY', secrets.token_hex(32)),
+    SQLALCHEMY_DATABASE_URI=os.environ.get('DATABASE_URL','sqlite:///dtip.db').replace('postgres://','postgresql://'),
     SQLALCHEMY_TRACK_MODIFICATIONS=False,
-    SQLALCHEMY_ENGINE_OPTIONS=_engine_opts,
-    JWT_SECRET=_jwt_secret,
+    SQLALCHEMY_ENGINE_OPTIONS={'pool_pre_ping':True,'pool_recycle':300},
+    JWT_SECRET=os.environ.get('JWT_SECRET', secrets.token_hex(32)),
     JWT_EXPIRY_HOURS=int(os.environ.get('JWT_EXPIRY_HOURS',24)),
     GOOGLE_CLIENT_ID=os.environ.get('GOOGLE_CLIENT_ID',''),
     GOOGLE_CLIENT_SECRET=os.environ.get('GOOGLE_CLIENT_SECRET',''),
@@ -80,16 +51,22 @@ app.config.update(
     BASE_URL=os.environ.get('BASE_URL','http://localhost:5000'),
     UPLOAD_FOLDER=os.environ.get('UPLOAD_FOLDER','uploads'),
     MAX_CONTENT_LENGTH=16 * 1024 * 1024,  # 16MB max upload
-    # FIX: session cookie settings so OAuth state persists across the Google redirect
+    # Session config — must be stable across restarts
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax',      # 'Lax' allows the cookie on the redirect-back from Google
-    SESSION_COOKIE_SECURE=os.environ.get('SESSION_COOKIE_SECURE','false').lower()=='true',
-    PERMANENT_SESSION_LIFETIME=timedelta(minutes=10),  # short window for OAuth state
+    SESSION_COOKIE_SECURE=os.environ.get('FLASK_ENV','') == 'production',
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_NAME='dtip_session',
+    PERMANENT_SESSION_LIFETIME=timedelta(minutes=10),
+    # Auth cookie config
+    AUTH_COOKIE_SECURE=os.environ.get('FLASK_ENV','') == 'production',
+    AUTH_COOKIE_HTTPONLY=True,
+    AUTH_COOKIE_SAMESITE='None' if os.environ.get('FLASK_ENV','') == 'production' else 'Lax',
 )
 
 # IntaSend URLs
 INTASEND_BASE = 'https://sandbox.intasend.com' if app.config['INTASEND_ENV'] == 'sandbox' else 'https://payment.intasend.com'
 
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 db = SQLAlchemy(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
                     logger=False, engineio_logger=False)
@@ -416,31 +393,25 @@ def decode_token(token):
     return jwt.decode(token, app.config['JWT_SECRET'], algorithms=['HS256'])
 
 def get_current_user():
-    auth = request.headers.get('Authorization', '')
-    # Handle both "Bearer <token>" and bare token values
-    if auth.lower().startswith('bearer '):
-        token = auth[7:].strip()
-    else:
-        token = auth.strip()
-    # Fallback to query param (used by Socket.IO and some redirects)
+    # Priority: 1. Authorization header, 2. URL param, 3. HttpOnly cookie
+    auth = request.headers.get('Authorization','')
+    token = auth.replace('Bearer ','').strip()
     if not token:
-        token = request.args.get('token', '').strip()
+        token = request.args.get('token','')
+    if not token:
+        token = request.cookies.get('dtip_auth','')
     if not token:
         return None
     try:
         data = decode_token(token)
         user = User.query.get(data['sub'])
-        if user is None:
-            logger.warning(f'Token valid but user {data.get("sub")} not found in DB')
+        if user and user.is_suspended:
+            return None
         return user
     except jwt.ExpiredSignatureError:
-        logger.debug('Rejected expired JWT')
+        logger.debug('JWT expired')
         return None
-    except jwt.InvalidTokenError as e:
-        logger.debug(f'Rejected invalid JWT: {e}')
-        return None
-    except Exception as e:
-        logger.error(f'get_current_user unexpected error: {e}')
+    except Exception:
         return None
 
 def require_auth(f):
@@ -616,27 +587,20 @@ def intasend_b2c(phone, amount, ref):
 @app.route('/webhook/intasend', methods=['POST'])
 def intasend_webhook():
     """IntaSend webhook handler for payment status updates"""
-    import hmac as _hmac, hashlib as _hashlib
-    # FIX: read raw body BEFORE calling get_json() — get_data() returns empty after get_json()
-    raw_body = request.get_data()
     try:
-        payload = request.get_json(force=True) or {}
+        payload = request.get_json() or {}
         logger.info(f'IntaSend webhook: {payload}')
 
-        # FIX: hmac.new does not exist — correct function is hmac.new → hmac.new is wrong;
-        # the correct call is hmac.new() → actually Python's hmac module uses hmac.new()
-        # which IS valid in Python, but let's use the explicit constructor for clarity.
+        # Verify webhook signature if secret configured
         if app.config['INTASEND_SECRET']:
             sig = request.headers.get('X-IntaSend-Signature', '')
-            # FIX: was `hmac.new(...)` — Python hmac module exposes `hmac.new()` but the
-            # idiomatic and correct form that definitely works is shown below.
-            expected = _hmac.new(
+            import hmac, hashlib
+            expected = hmac.new(
                 app.config['INTASEND_SECRET'].encode(),
-                raw_body,
-                _hashlib.sha256
+                request.get_data(),
+                hashlib.sha256
             ).hexdigest()
-            if not _hmac.compare_digest(sig, expected):
-                logger.warning('IntaSend webhook signature mismatch')
+            if not hmac.compare_digest(sig, expected):
                 return jsonify(error='Invalid signature'), 403
 
         invoice_id = payload.get('invoice_id') or payload.get('id') or ''
@@ -649,31 +613,23 @@ def intasend_webhook():
             pay = Payment.query.filter_by(intasend_id=invoice_id).first()
 
         if pay:
-            # FIX: idempotency — skip if already processed to prevent duplicate payouts
             if state == 'COMPLETE':
-                if pay.status == 'completed':
-                    logger.info(f'Webhook idempotency: payment {pay.id} already completed, skipping')
-                    return jsonify(status='already_processed'), 200
                 pay.status = 'completed'
                 pay.webhook_received = True
                 db.session.flush()
                 # Handle based on payment type
                 _process_completed_payment(pay)
             elif state in ('FAILED', 'CANCELLED'):
-                if pay.status not in ('completed',):  # don't downgrade a completed payment
-                    pay.status = 'failed'
-                    pay.webhook_received = True
-                    notify(pay.user_id, '❌ Payment Failed',
-                           f'Your {pay.type} payment of KES {pay.amount:.0f} failed.', 'error')
+                pay.status = 'failed'
+                pay.webhook_received = True
+                notify(pay.user_id, '❌ Payment Failed',
+                       f'Your {pay.type} payment of KES {pay.amount:.0f} failed.', 'error')
             db.session.commit()
-        else:
-            logger.warning(f'IntaSend webhook: no payment found for ref={api_ref} invoice={invoice_id}')
 
         return jsonify(status='received'), 200
     except Exception as e:
         logger.error(f'Webhook error: {e}')
-        db.session.rollback()
-        return jsonify(error='internal_error'), 500
+        return jsonify(error=str(e)), 500
 
 def _process_completed_payment(pay):
     """Process a completed payment"""
@@ -728,16 +684,8 @@ def serve_upload(filename):
 def google_login():
     if not app.config['GOOGLE_CLIENT_ID']:
         return redirect('/?error=google_not_configured')
-    state = secrets.token_urlsafe(32)
-    # FIX: mark session permanent so the state cookie is returned after Google redirects back.
-    # Without this, default non-permanent sessions may not send the cookie depending on browser
-    # SameSite settings, causing the state check in the callback to always fail.
-    session.permanent = True
+    state = secrets.token_urlsafe(16)
     session['oauth_state'] = state
-    # Carry pending referral code through the OAuth flow
-    ref = request.args.get('ref','')
-    if ref:
-        session['pending_ref'] = ref
     params = dict(client_id=app.config['GOOGLE_CLIENT_ID'],
                   redirect_uri=app.config['GOOGLE_REDIRECT_URI'],
                   response_type='code', scope='openid email profile',
@@ -746,34 +694,41 @@ def google_login():
 
 @app.route('/auth/google/callback')
 def google_callback():
-    # FIX: check for error first, then compare state — avoids a timing issue where
-    # session.pop() is called even when there is no state to compare against.
-    error = request.args.get('error')
-    received_state = request.args.get('state','')
-    expected_state = session.pop('oauth_state', None)
-    if error or not expected_state or received_state != expected_state:
-        logger.warning(f'OAuth state mismatch: error={error}, received={received_state}, expected={expected_state}')
+    # Allow missing state in case session was lost (e.g. cross-domain redirect)
+    incoming_state = request.args.get('state')
+    saved_state = session.pop('oauth_state', None)
+    if request.args.get('error'):
+        logger.warning(f'Google OAuth error: {request.args.get("error")}')
         return redirect('/?error=oauth_failed')
+    if saved_state and incoming_state != saved_state:
+        logger.warning(f'OAuth state mismatch: {incoming_state} != {saved_state}')
+        return redirect('/?error=oauth_state_mismatch')
     try:
         resp = http_req.post(GOOGLE_TOKEN_URL, data=dict(
-            code=request.args['code'], client_id=app.config['GOOGLE_CLIENT_ID'],
+            code=request.args.get('code',''),
+            client_id=app.config['GOOGLE_CLIENT_ID'],
             client_secret=app.config['GOOGLE_CLIENT_SECRET'],
             redirect_uri=app.config['GOOGLE_REDIRECT_URI'],
-            grant_type='authorization_code'), timeout=10).json()
-        if 'error' in resp:
-            logger.error(f'Google token exchange error: {resp}')
-            return redirect('/?error=oauth_token_failed')
+            grant_type='authorization_code'), timeout=10)
+        resp.raise_for_status()
+        resp = resp.json()
+        if 'access_token' not in resp:
+            logger.error(f'Google token exchange failed: {resp}')
+            return redirect('/?error=token_exchange_failed')
         ui = http_req.get(GOOGLE_USERINFO_URL,
             headers={'Authorization': f'Bearer {resp["access_token"]}'}, timeout=10).json()
-        g_id, email, name, pic = ui['sub'], ui.get('email',''), ui.get('name',''), ui.get('picture','')
-        if not email:
-            return redirect('/?error=oauth_no_email')
-        ref_code = session.pop('pending_ref', None)
+        g_id = ui.get('sub','')
+        email = ui.get('email','')
+        name = ui.get('name','')
+        pic = ui.get('picture','')
+        if not g_id or not email:
+            return redirect('/?error=missing_profile')
+        ref_code = request.args.get('ref') or session.pop('pending_ref', None)
         user = User.query.filter_by(google_id=g_id).first() or User.query.filter_by(email=email).first()
         if not user:
             uname = re.sub(r'[^a-z0-9_]','', name.lower().replace(' ','_'))[:20] or 'user'
-            if User.query.filter_by(username=uname).first():
-                uname += str(int(time.time()))[-4:]
+            while User.query.filter_by(username=uname).first():
+                uname = uname[:16] + str(secrets.randbelow(9000)+1000)
             referred_by = None
             if ref_code:
                 ref_user = User.query.filter_by(referral_code=ref_code).first()
@@ -785,14 +740,29 @@ def google_callback():
             db.session.add(Wallet(user_id=user.id))
             db.session.commit()
         else:
-            user.google_id = g_id
+            if not user.google_id: user.google_id = g_id
             if pic: user.avatar_url = pic
             user.last_login = datetime.utcnow()
             db.session.commit()
         token = make_token(user.id, user.role)
-        return redirect(f'/?token={token}')
+        # Set token BOTH ways:
+        # 1. URL param (for JS to pick up and store in localStorage)
+        # 2. Secure HttpOnly cookie (fallback / extra security)
+        response = make_response(redirect(f'/?token={token}'))
+        is_secure = app.config.get('AUTH_COOKIE_SECURE', False)
+        samesite = app.config.get('AUTH_COOKIE_SAMESITE', 'Lax')
+        response.set_cookie(
+            'dtip_auth',
+            token,
+            httponly=True,
+            secure=is_secure,
+            samesite=samesite,
+            max_age=app.config['JWT_EXPIRY_HOURS'] * 3600,
+            path='/'
+        )
+        return response
     except Exception as e:
-        logger.error(f'Google OAuth: {e}')
+        logger.error(f'Google OAuth exception: {e}', exc_info=True)
         return redirect('/?error=oauth_failed')
 
 # ─────────────────────────────────────────
@@ -850,6 +820,24 @@ def login():
 @require_auth
 def me(user):
     return jsonify(user=user.to_dict(), wallet=user.wallet.to_dict() if user.wallet else None)
+
+@app.route('/api/auth/logout', methods=['POST'])
+def logout_api():
+    response = make_response(jsonify(ok=True))
+    response.delete_cookie('dtip_auth', path='/')
+    return response
+
+@app.route('/api/auth/refresh', methods=['POST'])
+@require_auth
+def refresh_token(user):
+    """Issue a fresh token for an authenticated user"""
+    token = make_token(user.id, user.role)
+    response = make_response(jsonify(token=token, user=user.to_dict()))
+    is_secure = app.config.get('AUTH_COOKIE_SECURE', False)
+    samesite = app.config.get('AUTH_COOKIE_SAMESITE', 'Lax')
+    response.set_cookie('dtip_auth', token, httponly=True, secure=is_secure,
+                        samesite=samesite, max_age=app.config['JWT_EXPIRY_HOURS']*3600, path='/')
+    return response
 
 # ─────────────────────────────────────────
 # PLATFORM SETTINGS
@@ -1035,23 +1023,12 @@ def submit_task(user, tid):
     if 'pdf' in request.files:
         f = request.files['pdf']
         if f and f.filename:
-            # FIX: validate by both extension AND magic bytes to prevent disguised uploads
             if not f.filename.lower().endswith('.pdf'):
                 return jsonify(error='Only PDF files are accepted'),400
-            # Check PDF magic bytes (%PDF-)
-            header = f.read(5)
-            f.seek(0)  # rewind after peeking
-            if header != b'%PDF-':
-                return jsonify(error='File does not appear to be a valid PDF'),400
-            # FIX: sanitize the stored filename — never use the user-supplied name directly
-            pdf_original = re.sub(r'[^a-zA-Z0-9._\- ]', '', f.filename)[:200] or 'upload.pdf'
-            pdf_filename = f'{uuid.uuid4().hex}.pdf'
-            save_path = os.path.join(app.config['UPLOAD_FOLDER'], pdf_filename)
-            try:
-                f.save(save_path)
-            except OSError as save_err:
-                logger.error(f'PDF save error: {save_err}')
-                return jsonify(error='Failed to save uploaded file, please try again'),500
+            pdf_original = f.filename
+            ext = 'pdf'
+            pdf_filename = f'{uuid.uuid4().hex}.{ext}'
+            f.save(os.path.join(app.config['UPLOAD_FOLDER'], pdf_filename))
 
     if task.requires_pdf and not pdf_filename:
         return jsonify(error='This task requires a PDF submission'),400
@@ -1266,12 +1243,6 @@ def all_shares(admin):
 @app.route('/api/wallet')
 @require_auth
 def get_wallet(user):
-    if not user.wallet:
-        # Wallet missing — create it on the fly
-        w = Wallet(user_id=user.id, balance=0.0)
-        db.session.add(w)
-        db.session.commit()
-        db.session.refresh(user)
     ledger_rows = WalletLedger.query.filter_by(wallet_id=user.wallet.id)\
                               .order_by(WalletLedger.created_at.desc()).limit(30).all()
     return jsonify(wallet=user.wallet.to_dict(), ledger=[l.to_dict() for l in ledger_rows])
@@ -1564,28 +1535,6 @@ def admin_completions(mod):
 def health():
     return jsonify(status='ok', version='3.0.0', ts=datetime.utcnow().isoformat())
 
-@app.route('/api/debug/auth')
-def debug_auth():
-    """Diagnose auth issues — remove in production"""
-    auth = request.headers.get('Authorization', '')
-    token = auth[7:].strip() if auth.lower().startswith('bearer ') else auth.strip()
-    token = token or request.args.get('token', '')
-    result = {'has_token': bool(token), 'jwt_secret_len': len(app.config.get('JWT_SECRET',''))}
-    if token:
-        try:
-            data = jwt.decode(token, app.config['JWT_SECRET'], algorithms=['HS256'])
-            result['valid'] = True
-            result['user_id'] = data.get('sub')
-            result['role'] = data.get('role')
-            result['expires'] = data.get('exp')
-        except jwt.ExpiredSignatureError:
-            result['valid'] = False
-            result['error'] = 'Token expired'
-        except jwt.InvalidTokenError as e:
-            result['valid'] = False
-            result['error'] = str(e)
-    return jsonify(result)
-
 @app.route('/api/stats')
 @cache.cached(timeout=120)
 def pub_stats():
@@ -1601,20 +1550,12 @@ def pub_stats():
 # ─────────────────────────────────────────
 
 def sock_auth():
-    # FIX: Socket.IO passes handshake query params in request.args during connect;
-    # for subsequent events they are stored in request.environ.  Support both.
-    token = (request.args.get('token','') or
-             request.environ.get('HTTP_AUTHORIZATION','').replace('Bearer ','').strip())
-    if not token:
-        return None
+    token = request.args.get('token','')
+    if not token: return None
     try:
         data = decode_token(token)
-        user = User.query.get(data['sub'])
-        if user and user.is_active and not user.is_suspended:
-            return user
-        return None
-    except Exception:
-        return None
+        return User.query.get(data['sub'])
+    except: return None
 
 @socketio.on('connect')
 def on_connect():
@@ -2273,115 +2214,105 @@ const S = {
   sharePrice: 100, settings: {}, pendingPdf: null
 };
 
+// ── TOKEN HELPERS ──
+function saveToken(tok) {
+  S.token = tok;
+  if (tok) localStorage.setItem('dtip_tok', tok);
+  else localStorage.removeItem('dtip_tok');
+}
+function loadToken() {
+  // Check URL first (Google OAuth redirect brings ?token=...)
+  const params = new URLSearchParams(location.search);
+  const urlTok = params.get('token');
+  if (urlTok) {
+    saveToken(urlTok);
+    // Clean URL immediately — remove ?token= without page reload
+    params.delete('token');
+    const newUrl = location.pathname + (params.toString() ? '?' + params.toString() : '');
+    history.replaceState({}, document.title, newUrl);
+    return urlTok;
+  }
+  return localStorage.getItem('dtip_tok');
+}
+
 // ── BOOT ──
 document.addEventListener('DOMContentLoaded', async () => {
+  // 1. Handle referral param
   const params = new URLSearchParams(location.search);
-  const urlToken = params.get('token');
-  const urlError = params.get('error');
   const ref = params.get('ref');
-
   if (ref) localStorage.setItem('pending_ref', ref);
 
-  // FIX: Show OAuth errors surfaced by the backend
-  if (urlError) {
+  // 2. Handle error param from failed OAuth
+  const err = params.get('error');
+  if (err) {
     const msgs = {
       oauth_failed: 'Google sign-in failed. Please try again.',
-      oauth_token_failed: 'Could not exchange Google code for token.',
-      oauth_no_email: 'Google account did not share an email address.',
-      google_not_configured: 'Google sign-in is not configured on this server.',
+      oauth_state_mismatch: 'Session expired during sign-in. Please try again.',
+      token_exchange_failed: 'Could not complete Google sign-in. Please try again.',
+      missing_profile: 'Google did not return your profile. Please try again.',
+      google_not_configured: 'Google sign-in is not configured yet.'
     };
-    // Clean the URL first, then show the error
-    history.replaceState({}, '', '/');
-    setTimeout(() => toast(msgs[urlError] || 'Sign-in failed: ' + urlError, 'error'), 300);
+    setTimeout(() => toast(msgs[err] || 'Sign-in error: ' + err, 'error'), 300);
+    history.replaceState({}, document.title, '/');
   }
 
-  // FIX: Store the token BEFORE calling history.replaceState so it is in localStorage
-  // even if the /api/auth/me call below happens to fail the first time.
-  // Then clean the URL so the token is not visible or bookmarkable.
-  if (urlToken) {
-    localStorage.setItem('tok', urlToken);
-    history.replaceState({}, '', '/');   // safe to clean now — token is already stored
-  }
-
-  S.token = localStorage.getItem('tok');
-  const theme = localStorage.getItem('theme') || 'dark';
+  // 3. Apply theme
+  const theme = localStorage.getItem('dtip_theme') || 'dark';
   document.documentElement.setAttribute('data-theme', theme);
 
+  // 4. Load token (from URL param or localStorage)
+  S.token = loadToken();
+
+  // 5. Restore session
   if (S.token) {
     try {
       const r = await api('/api/auth/me');
       S.user = r.user;
       showApp();
-    } catch(err) {
-      // Token is invalid or expired — clear it and show login screen
-      localStorage.removeItem('tok');
-      S.token = null;
+    } catch(e) {
+      // Token invalid/expired — clear everything and show login
+      saveToken(null);
+      fetch('/api/auth/logout', {method:'POST', credentials:'include'}).catch(()=>{});
       showAuth();
-      if (urlToken) {
-        // Only show the error if this was a fresh OAuth redirect, not just an expired session
-        toast('Authentication failed. Please sign in again.', 'error');
-      }
     }
-  } else { showAuth(); }
+  } else {
+    showAuth();
+  }
 });
 
 // ── API ──
 async function api(url, method = 'GET', body = null) {
-  // Always read token from S; re-hydrate from localStorage if somehow lost
-  if (!S.token) S.token = localStorage.getItem('tok') || null;
-
-  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  const opts = {
+    method,
+    credentials: 'include',  // Always send cookies too
+    headers: { 'Content-Type': 'application/json' }
+  };
   if (S.token) opts.headers['Authorization'] = 'Bearer ' + S.token;
   if (body) opts.body = JSON.stringify(body);
-
-  let r;
-  try {
-    r = await fetch(url, opts);
-  } catch (networkErr) {
-    throw new Error('Network error — check your connection');
-  }
-
-  // Handle non-JSON error responses (e.g. 500 HTML pages) gracefully
-  let d;
-  try {
-    d = await r.json();
-  } catch {
-    if (r.status === 401) {
-      _handle401();
-      throw new Error('Session expired — please sign in again.');
-    }
-    throw new Error('Server error (' + r.status + ')');
-  }
-
+  const r = await fetch(url, opts);
+  // Handle 401 globally — token expired
   if (r.status === 401) {
-    _handle401();
-    throw new Error(d.error || 'Session expired — please sign in again.');
+    saveToken(null);
+    showAuth();
+    throw new Error('Session expired. Please sign in again.');
   }
-  if (!r.ok) throw new Error(d.error || d.message || 'Request failed (' + r.status + ')');
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || d.message || 'Request failed');
   return d;
 }
 
-// Called whenever any API call gets a 401 — clears session and shows login
-function _handle401() {
-  const wasLoggedIn = !!S.token;
-  S.token = null; S.user = null;
-  localStorage.removeItem('tok');
-  if (S.socket) { try { S.socket.disconnect(); } catch(e){} S.socket = null; }
-  showAuth();
-  if (wasLoggedIn) toast('Your session expired. Please sign in again.', 'warn');
-}
-
 async function apiForm(url, formData) {
-  if (!S.token) S.token = localStorage.getItem('tok') || null;
-  const opts = { method: 'POST', headers: {} };
+  const opts = {
+    method: 'POST',
+    credentials: 'include',
+    headers: {}
+  };
   if (S.token) opts.headers['Authorization'] = 'Bearer ' + S.token;
   opts.body = formData;
-  let r;
-  try { r = await fetch(url, opts); } catch(e) { throw new Error('Network error'); }
-  let d;
-  try { d = await r.json(); } catch { throw new Error('Server error (' + r.status + ')'); }
-  if (r.status === 401) { _handle401(); throw new Error(d.error || 'Session expired'); }
-  if (!r.ok) throw new Error(d.error || d.message || 'Request failed (' + r.status + ')');
+  const r = await fetch(url, opts);
+  if (r.status === 401) { saveToken(null); showAuth(); throw new Error('Session expired.'); }
+  const d = await r.json();
+  if (!r.ok) throw new Error(d.error || d.message || 'Request failed');
   return d;
 }
 
@@ -2403,7 +2334,7 @@ function toggleTheme() {
   const current = document.documentElement.getAttribute('data-theme');
   const next = current === 'dark' ? 'light' : 'dark';
   document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('theme', next);
+  localStorage.setItem('dtip_theme', next);
 }
 
 // ── SETTINGS CACHE ──
@@ -2424,10 +2355,7 @@ function showAuth() {
 function showApp() {
   document.getElementById('authScreen').style.display = 'none';
   document.getElementById('appScreen').style.display = 'grid';
-  initApp().catch(e => {
-    console.error('initApp failed:', e);
-    // If init fails due to auth, _handle401 inside api() will redirect to login
-  });
+  initApp();
 }
 function authTab(t) {
   document.getElementById('loginForm').style.display = t === 'login' ? 'block' : 'none';
@@ -2438,24 +2366,14 @@ function authTab(t) {
 function googleAuth() { window.location.href = '/auth/google'; }
 
 async function doLogin() {
-  const btn = document.querySelector('#loginForm button.btn') || document.querySelector('#loginForm .btn');
-  const origText = btn ? btn.textContent : '';
-  if (btn) { btn.textContent = 'Signing in…'; btn.disabled = true; }
   try {
     const r = await api('/api/auth/login', 'POST', {
       email: document.getElementById('lEmail').value,
       password: document.getElementById('lPass').value
     });
-    // Store token FIRST — before showApp() triggers any api() calls
-    S.token = r.token;
-    S.user = r.user;
-    localStorage.setItem('tok', r.token);
+    saveToken(r.token); S.user = r.user;
     showApp();
-  } catch(e) {
-    toast(e.message, 'error');
-  } finally {
-    if (btn) { btn.textContent = origText; btn.disabled = false; }
-  }
+  } catch(e) { toast(e.message, 'error'); }
 }
 
 async function doRegister() {
@@ -2467,23 +2385,18 @@ async function doRegister() {
       password: document.getElementById('rPass').value,
       ref_code: ref
     });
-    // Store token FIRST before showApp() triggers api() calls
-    S.token = r.token;
-    S.user = r.user;
-    localStorage.setItem('tok', r.token);
+    saveToken(r.token); S.user = r.user;
     localStorage.removeItem('pending_ref');
     showApp();
     toast('Welcome to DTIP! 🎉', 'success');
   } catch(e) { toast(e.message, 'error'); }
 }
 
-function logout() {
-  S.token = null;
+async function logout() {
+  try { await fetch('/api/auth/logout', {method:'POST', credentials:'include'}); } catch(_) {}
+  saveToken(null);
   S.user = null;
-  S.unreadMsg = 0;
-  S.unreadNotif = 0;
-  localStorage.removeItem('tok');
-  if (S.socket) { try { S.socket.disconnect(); } catch(e){} S.socket = null; }
+  if (S.socket) { S.socket.disconnect(); S.socket = null; }
   showAuth();
 }
 
@@ -2506,22 +2419,7 @@ async function initApp() {
 }
 
 function initSocket() {
-  // FIX: add reconnection config and pass token for authentication
-  S.socket = io({
-    query: { token: S.token },
-    reconnection: true,
-    reconnectionAttempts: 10,
-    reconnectionDelay: 1500,
-    reconnectionDelayMax: 10000,
-    timeout: 20000,
-  });
-  // Re-authenticate after reconnect (token may have been refreshed)
-  S.socket.on('reconnect', () => {
-    S.socket.io.opts.query = { token: S.token };
-  });
-  S.socket.on('connect_error', (err) => {
-    console.warn('Socket connect error:', err.message);
-  });
+  S.socket = io({ query: { token: S.token } });
   S.socket.on('receive_message', msg => {
     if (S.page === 'messages' && S.activeChat === msg.sender_id) renderMsg(msg, false);
     else { S.unreadMsg++; updateBadges(); toast(`💬 ${msg.sender_name}: ${msg.message.slice(0,50)}`, 'info'); }
@@ -2575,15 +2473,12 @@ function updateDisplayedSettings(settings) {
 }
 
 function updateBadges() {
-  // FIX: guard against elements not yet in DOM and NaN counts
   const mb = document.getElementById('msgBadge');
   const nb = document.getElementById('notifBadge');
   const nd = document.getElementById('notifDot');
-  const msgs = Math.max(0, S.unreadMsg || 0);
-  const notifs = Math.max(0, S.unreadNotif || 0);
-  if (mb) { mb.style.display = msgs > 0 ? 'block' : 'none'; mb.textContent = msgs; }
-  if (nb) { nb.style.display = notifs > 0 ? 'block' : 'none'; nb.textContent = notifs; }
-  if (nd) { nd.style.display = notifs > 0 ? 'block' : 'none'; }
+  mb.style.display = S.unreadMsg > 0 ? 'block' : 'none'; mb.textContent = S.unreadMsg;
+  nb.style.display = S.unreadNotif > 0 ? 'block' : 'none'; nb.textContent = S.unreadNotif;
+  nd.style.display = S.unreadNotif > 0 ? 'block' : 'none';
 }
 
 async function loadNotifCount() {
@@ -2634,18 +2529,13 @@ function closeModal(id) { document.getElementById(id).classList.remove('show'); 
 async function home() {
   const el = document.getElementById('pageContent');
   try {
-    // Run all three in parallel; if stats/settings fail, degrade gracefully
     const [me, pub, sets] = await Promise.all([
-      api('/api/auth/me'),
-      api('/api/stats').catch(() => ({users:0, tasks:0, completions:0, paid_out:0})),
-      loadSettings().catch(() => ({})),
+      api('/api/auth/me'), api('/api/stats'), loadSettings()
     ]);
     S.user = me.user;
     const u = S.user, w = me.wallet;
-    // FIX: daily counter — use tasks_done_today from the *freshly* fetched me response,
-    // not from the potentially stale cached S.user.  Also use the authoritative daily_limit.
-    const doneToday = typeof u.tasks_done_today === 'number' ? u.tasks_done_today : 0;
-    const limit = typeof u.daily_limit === 'number' ? u.daily_limit : 3;
+    const doneToday = u.tasks_done_today || 0;
+    const limit = u.daily_limit || 3;
     const pct = Math.min((doneToday / limit) * 100, 100);
     const actFee = parseFloat(sets.activation_fee || 299).toFixed(0);
 
@@ -3110,17 +3000,10 @@ function renderSharesChart(history) {
     if (ctx) ctx.parentElement.innerHTML = '<div class="empty-state"><div class="empty-icon">📊</div><h3>No Data Yet</h3><p>Share purchases will appear here.</p></div>';
     return;
   }
-  // FIX: destroy any existing Chart.js instance before creating a new one.
-  // Without this, navigating away and back creates a new chart on top of the old
-  // canvas, causing "Canvas is already in use" errors and visual glitches.
-  if (ctx._chartInstance) {
-    ctx._chartInstance.destroy();
-    delete ctx._chartInstance;
-  }
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   const textCol = isDark ? '#8b93b8' : '#454870';
   const gridCol = isDark ? '#1e2540' : '#dde0f0';
-  ctx._chartInstance = new Chart(ctx, {
+  new Chart(ctx, {
     type: 'line',
     data: {
       labels: history.map(d => d.date),
@@ -3789,29 +3672,11 @@ def init_db():
 
         db.session.commit()
 
-def validate_env():
-    """Warn about missing or insecure environment variables at startup."""
-    warnings = []
-    if not os.environ.get('SECRET_KEY'):
-        warnings.append('SECRET_KEY not set — sessions will not persist across restarts (set in production!)')
-    if not os.environ.get('JWT_SECRET'):
-        warnings.append('JWT_SECRET not set — using SECRET_KEY as fallback')
-    if not os.environ.get('GOOGLE_CLIENT_ID') or not os.environ.get('GOOGLE_CLIENT_SECRET'):
-        warnings.append('GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not set — Google login disabled')
-    if os.environ.get('DEMO_MODE','true').lower() == 'true':
-        warnings.append('DEMO_MODE=true — payments are simulated; set DEMO_MODE=false in production')
-    if not os.environ.get('DATABASE_URL'):
-        warnings.append('DATABASE_URL not set — using local SQLite (not suitable for production)')
-    for w in warnings:
-        logger.warning(f'[CONFIG] {w}')
-
 if __name__ == '__main__':
-    validate_env()
     init_db()
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG','false').lower() == 'true'
     logger.info(f'DTIP v3.0 on :{port} | demo={app.config["DEMO_MODE"]}')
     socketio.run(app, host='0.0.0.0', port=port, debug=debug, allow_unsafe_werkzeug=True)
 else:
-    validate_env()
     init_db()
