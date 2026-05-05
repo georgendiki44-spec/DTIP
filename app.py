@@ -2,7 +2,7 @@
 DTIP v3 — Full-featured Digital Tasks & Earning Platform
 Features: PDF uploads, AI detection, IntaSend webhooks, moderators, share graphs,
           live settings sync, alerts, premium suspension, advanced admin controls
-Run: python app.py | gunicorn -k gevent -w 1 app:app
+Run: python app.py | gunicorn -w 1 --threads 4 app:app
 """
 
 import os, re, uuid, secrets, logging, time, base64, json
@@ -56,7 +56,7 @@ app.config.update(
 INTASEND_BASE = 'https://sandbox.intasend.com' if app.config['INTASEND_ENV'] == 'sandbox' else 'https://payment.intasend.com'
 
 db = SQLAlchemy(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='gevent',
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading',
                     logger=False, engineio_logger=False)
 cache = Cache(app)
 limiter = Limiter(key_func=get_remote_address, app=app,
@@ -3541,6 +3541,6 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     debug = os.environ.get('FLASK_DEBUG','false').lower() == 'true'
     logger.info(f'DTIP v3.0 on :{port} | demo={app.config["DEMO_MODE"]}')
-    socketio.run(app, host='0.0.0.0', port=port, debug=debug)
+    socketio.run(app, host='0.0.0.0', port=port, debug=debug, allow_unsafe_werkzeug=True)
 else:
     init_db()
